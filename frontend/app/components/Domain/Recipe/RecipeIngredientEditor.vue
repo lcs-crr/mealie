@@ -116,7 +116,7 @@
           density="compact"
           variant="solo"
           return-object
-          :items="filteredFoods"
+          :items="displayFoods"
           :custom-filter="() => true"
           item-title="name"
           class="mx-1 py-0"
@@ -226,12 +226,13 @@
 
 <script setup lang="ts">
 import { ref, computed, reactive, toRefs, watch } from "vue";
+import type { PropType } from "vue";
 import { useDisplay } from "vuetify";
 import { useI18n } from "vue-i18n";
 import { useFoodStore, useFoodData, useUnitStore, useUnitData } from "~/composables/store";
 import { useSearch } from "~/composables/use-search";
 import { useNuxtApp } from "#app";
-import type { RecipeIngredient } from "~/lib/api/types/recipe";
+import type { IngredientFood, RecipeIngredient } from "~/lib/api/types/recipe";
 import { usePublicExploreApi, useUserApi } from "~/composables/api";
 import { useRecipeSearch } from "~/composables/recipes/use-recipe-search";
 
@@ -262,6 +263,10 @@ const props = defineProps({
   foodErrorTooltip: {
     type: String,
     default: "",
+  },
+  priorityFoods: {
+    type: Array as PropType<IngredientFood[]>,
+    default: () => [],
   },
   enableContextMenu: {
     type: Boolean,
@@ -343,6 +348,26 @@ const foodStore = useFoodStore();
 const foodData = useFoodData();
 const foodAutocomplete = ref<HTMLInputElement>();
 const { search: foodSearch, filtered: filteredFoods } = useSearch(foodStore.store);
+
+// Surface semantically-suggested foods (from the parser) at the top of the dropdown. With an empty
+// search they lead the full list; while searching, any that match are lifted above the rest.
+const displayFoods = computed<IngredientFood[]>(() => {
+  const priority = props.priorityFoods ?? [];
+  const filtered = filteredFoods.value as IngredientFood[];
+  if (!priority.length) {
+    return filtered;
+  }
+
+  const priorityIds = new Set(priority.map(f => f.id));
+  const searchTerm = (foodSearch.value ?? "").trim();
+  if (!searchTerm) {
+    return [...priority, ...filtered.filter(f => !priorityIds.has(f.id))];
+  }
+
+  const matched = filtered.filter(f => priorityIds.has(f.id));
+  const rest = filtered.filter(f => !priorityIds.has(f.id));
+  return [...matched, ...rest];
+});
 
 const showCreateFood = computed(() =>
   !!foodSearch.value

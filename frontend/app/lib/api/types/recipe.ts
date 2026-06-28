@@ -213,6 +213,7 @@ export interface ParsedIngredient {
   input?: string | null;
   confidence?: IngredientConfidence;
   ingredient: RecipeIngredient;
+  foodCandidates?: IngredientFood[];
 }
 export interface RecipeIngredient {
   quantity?: number | null;

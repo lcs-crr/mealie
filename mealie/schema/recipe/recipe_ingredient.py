@@ -379,6 +379,12 @@ class ParsedIngredient(MealieModel):
     input: str | None = None
     confidence: IngredientConfidence = IngredientConfidence()
     ingredient: RecipeIngredient
+    food_candidates: list[IngredientFood] = []
+    """Existing foods semantically closest to the parsed food, best-first.
+
+    Populated only by the OpenAI parser when semantic matching is enabled; used by the UI to surface
+    the most likely foods at the top of the food picker. Empty otherwise.
+    """
 
 
 class RegisteredParser(enum.StrEnum):

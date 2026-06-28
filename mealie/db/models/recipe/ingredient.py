@@ -12,6 +12,7 @@ from mealie.db.models.recipe.labels import MultiPurposeLabel
 
 from .._model_utils.auto_init import auto_init
 from .._model_utils.guid import GUID
+from .._model_utils.vector import Vector
 
 if TYPE_CHECKING:
     from ..group import Group
@@ -175,6 +176,13 @@ class IngredientFoodModel(SqlAlchemyBase, BaseMixins):
     )
     extras: Mapped[list[IngredientFoodExtras]] = orm.relationship("IngredientFoodExtras", cascade="all, delete-orphan")
 
+    embedding: Mapped["IngredientFoodEmbeddingModel | None"] = orm.relationship(
+        "IngredientFoodEmbeddingModel",
+        back_populates="food",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
     label_id: FilterableColumn[GUID | None] = mapped_column(GUID, ForeignKey("multi_purpose_labels.id"), index=True)
     label: Mapped[MultiPurposeLabel | None] = orm.relationship(MultiPurposeLabel, uselist=False, back_populates="foods")
 
@@ -257,6 +265,32 @@ class IngredientFoodModel(SqlAlchemyBase, BaseMixins):
             )
 
         self.__table_args__ = tuple(tableargs)
+
+
+class IngredientFoodEmbeddingModel(SqlAlchemyBase, BaseMixins):
+    """Stores a single semantic embedding per food for semantic ingredient matching.
+
+    Written best-effort by the application; absence simply means the food falls back to
+    fuzzy string matching. ``source_text``/``model``/``dimensions`` are used to detect when
+    a stored embedding is stale and needs to be recomputed.
+    """
+
+    __tablename__ = "ingredient_food_embeddings"
+    id: Mapped[GUID] = mapped_column(GUID, primary_key=True, default=GUID.generate)
+
+    food_id: Mapped[GUID] = mapped_column(
+        GUID, ForeignKey("ingredient_foods.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    food: Mapped["IngredientFoodModel"] = orm.relationship("IngredientFoodModel", back_populates="embedding")
+
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_text: Mapped[str] = mapped_column(String, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector, nullable=False)
+
+    @auto_init()
+    def __init__(self, **_) -> None:
+        pass
 
 
 class IngredientUnitAliasModel(SqlAlchemyBase, BaseMixins):

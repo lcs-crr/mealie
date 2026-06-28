@@ -423,6 +423,30 @@ class AppSettings(AppLoggingSettings):
     files are individually optional, each prompt name will fall back to the default if no custom file exists
     """
 
+    OPENAI_EMBEDDING_MODEL: str | None = None
+    """
+    Embedding model name used to semantically match parsed foods against the existing foods database.
+    Requests are sent to the configured default AI provider's endpoint. When unset, semantic food
+    matching is disabled and parsers fall back to fuzzy string matching.
+    """
+
+    OPENAI_EMBEDDING_DIMENSIONS: int = 256
+    """
+    Number of dimensions to request for food embeddings. Smaller values reduce storage and speed up
+    matching; the model must support the requested dimensionality (e.g. OpenAI text-embedding-3-*).
+    """
+
+    OPENAI_FOOD_SEMANTIC_MATCH_THRESHOLD: float = 0.65
+    """
+    Minimum cosine similarity (on L2-normalized embeddings, range -1..1) required to automatically
+    link a parsed food to an existing food via semantic matching.
+    """
+
+    @property
+    def OPENAI_EMBEDDINGS_ENABLED(self) -> bool:
+        """Whether semantic food matching is configured. Provider availability is checked separately."""
+        return bool(self.OPENAI_EMBEDDING_MODEL)
+
     # ===============================================
     # Web Concurrency
 

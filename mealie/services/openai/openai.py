@@ -21,6 +21,7 @@ from mealie.schema.openai._base import OpenAIBase
 from mealie.schema.openai.general import OpenAIText
 
 from .._base_service import BaseService
+from .embeddings import normalize_vector
 
 T = TypeVar("T", bound=OpenAIBase)
 logger = root_logger.get_logger(__name__)
@@ -143,6 +144,66 @@ class OpenAIService(BaseService):
             default_headers=provider.request_headers or None,
             default_query=provider.request_params or None,
         )
+
+    def get_sync_client(self, provider: AIProviderOut) -> openai.OpenAI:
+        return openai.OpenAI(
+            base_url=provider.base_url or None,
+            api_key=provider.api_key,
+            timeout=provider.timeout,
+            default_headers=provider.request_headers or None,
+            default_query=provider.request_params or None,
+        )
+
+    @property
+    def embeddings_enabled(self) -> bool:
+        """Semantic matching requires a configured embedding model and a default provider."""
+        # Check the setting first so this short-circuits before touching provider attributes.
+        return bool(get_app_settings().OPENAI_EMBEDDING_MODEL and getattr(self, "default_provider", None))
+
+    def _embeddings_create_kwargs(self, texts: list[str]) -> dict:
+        settings = get_app_settings()
+        kwargs: dict = {"model": settings.OPENAI_EMBEDDING_MODEL, "input": texts}
+        if settings.OPENAI_EMBEDDING_DIMENSIONS:
+            kwargs["dimensions"] = settings.OPENAI_EMBEDDING_DIMENSIONS
+        return kwargs
+
+    async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts via the default provider, returning L2-normalized vectors (async)."""
+        if not texts:
+            return []
+        if not self.embeddings_enabled or self.default_provider is None:
+            raise OpenAINotEnabledException("No embedding model or default provider configured")
+
+        client = self.get_client(self.default_provider)
+        kwargs = self._embeddings_create_kwargs(texts)
+        try:
+            response = await client.embeddings.create(**kwargs)
+        except (TypeError, openai.BadRequestError):
+            # Some endpoints/models don't accept the `dimensions` parameter; retry without it.
+            if "dimensions" not in kwargs:
+                raise
+            kwargs.pop("dimensions", None)
+            response = await client.embeddings.create(**kwargs)
+        return [normalize_vector(item.embedding) for item in response.data]
+
+    def get_embeddings_sync(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts via the default provider, returning L2-normalized vectors (sync)."""
+        if not texts:
+            return []
+        if not self.embeddings_enabled or self.default_provider is None:
+            raise OpenAINotEnabledException("No embedding model or default provider configured")
+
+        client = self.get_sync_client(self.default_provider)
+        kwargs = self._embeddings_create_kwargs(texts)
+        try:
+            response = client.embeddings.create(**kwargs)
+        except (TypeError, openai.BadRequestError):
+            # Some endpoints/models don't accept the `dimensions` parameter; retry without it.
+            if "dimensions" not in kwargs:
+                raise
+            kwargs.pop("dimensions", None)
+            response = client.embeddings.create(**kwargs)
+        return [normalize_vector(item.embedding) for item in response.data]
 
     def _get_provider(self, attachments: list[OpenAIAttachment] | None = None) -> AIProviderOut:
         """Select the appropriate provider based on attachment types, falling back to the default."""

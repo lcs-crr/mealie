@@ -2,6 +2,8 @@ import json
 
 from rapidfuzz import fuzz
 
+from mealie.core import root_logger
+from mealie.core.config import get_app_settings
 from mealie.schema.openai.recipe_ingredient import OpenAIIngredient, OpenAIIngredients
 from mealie.schema.recipe.recipe_ingredient import (
     CreateIngredientFood,
@@ -11,9 +13,15 @@ from mealie.schema.recipe.recipe_ingredient import (
     RecipeIngredient,
 )
 from mealie.services.openai import OpenAIDataInjection, OpenAIService
+from mealie.services.openai.embeddings import top_k_matches
 
 from .._base import ABCIngredientParser
 from ..parser_utils import extract_quantity_from_string
+
+logger = root_logger.get_logger(__name__)
+
+#: Number of semantically-closest existing foods surfaced to the UI per ingredient.
+FOOD_CANDIDATE_COUNT = 5
 
 
 class OpenAIParser(ABCIngredientParser):
@@ -88,7 +96,8 @@ class OpenAIParser(ABCIngredientParser):
             comment=note_conf,
         )
 
-    def _convert_ingredient(self, original_text: str, openai_ing: OpenAIIngredient) -> ParsedIngredient:
+    def _build_ingredient(self, original_text: str, openai_ing: OpenAIIngredient) -> ParsedIngredient:
+        """Build a ParsedIngredient from the raw OpenAI response, without database matching."""
         ingredient = RecipeIngredient(
             original_text=original_text,
             quantity=openai_ing.quantity,
@@ -97,13 +106,48 @@ class OpenAIParser(ABCIngredientParser):
             note=openai_ing.note,
         )
 
-        parsed_ingredient = ParsedIngredient(
+        return ParsedIngredient(
             input=original_text,
             confidence=self._calculate_confidence(original_text, ingredient),
             ingredient=ingredient,
         )
 
-        return self.find_ingredient_match(parsed_ingredient)
+    async def _apply_semantic_matches(self, service: OpenAIService, parsed: list[ParsedIngredient]) -> None:
+        """Best-effort: link each parsed food to its closest existing food via embeddings.
+
+        Sets ``food_candidates`` (top-K closest existing foods) on every ingredient with a food, and
+        replaces the parsed food with the best match when it clears the similarity threshold. Any
+        failure leaves the ingredients untouched so the caller's fuzzy fallback still runs.
+        """
+        if not service.embeddings_enabled:
+            return
+
+        items: list[tuple[ParsedIngredient, str]] = [
+            (p, p.ingredient.food.name) for p in parsed if p.ingredient.food and p.ingredient.food.name
+        ]
+        if not items:
+            return
+
+        food_index = self.data_matcher.food_embeddings
+        if not food_index:
+            return
+
+        try:
+            query_vectors = await service.get_embeddings([name for _, name in items])
+        except Exception as e:
+            logger.warning(f"Semantic food matching skipped ({e.__class__.__name__}: {e})")
+            return
+
+        threshold = get_app_settings().OPENAI_FOOD_SEMANTIC_MATCH_THRESHOLD
+        for (parsed_ing, _), query_vector in zip(items, query_vectors, strict=True):
+            ranked = top_k_matches(query_vector, food_index, FOOD_CANDIDATE_COUNT)
+            if not ranked:
+                continue
+
+            parsed_ing.food_candidates = [food for food, _ in ranked]
+            best_food, best_score = ranked[0]
+            if best_score >= threshold:
+                parsed_ing.ingredient.food = best_food
 
     def _get_prompt(self, service: OpenAIService) -> str:
         if self.data_matcher.units_by_alias:
@@ -124,8 +168,7 @@ class OpenAIParser(ABCIngredientParser):
 
         return service.get_prompt("recipes.parse-recipe-ingredients", data_injections=data_injections)
 
-    async def _parse(self, ingredients: list[str]) -> OpenAIIngredients:
-        service = OpenAIService(self.repos)
+    async def _parse(self, service: OpenAIService, ingredients: list[str]) -> OpenAIIngredients:
         prompt = self._get_prompt(service)
 
         response = await service.get_response(
@@ -142,14 +185,20 @@ class OpenAIParser(ABCIngredientParser):
         return items[0]
 
     async def parse(self, ingredients: list[str]) -> list[ParsedIngredient]:
-        response = await self._parse(ingredients)
+        service = OpenAIService(self.repos)
+        response = await self._parse(service, ingredients)
         if len(response.ingredients) != len(ingredients):
             raise ValueError(
                 "OpenAI returned an unexpected number of ingredients. "
                 f"Expected {len(ingredients)}, got {len(response.ingredients)}"
             )
 
-        return [
-            self._convert_ingredient(original_text, ing)
+        parsed = [
+            self._build_ingredient(original_text, ing)
             for original_text, ing in zip(ingredients, response.ingredients, strict=True)
         ]
+
+        # Semantic matching links foods the LLM extracted to existing foods and surfaces candidates;
+        # find_ingredient_match then handles units and provides the fuzzy fallback for the rest.
+        await self._apply_semantic_matches(service, parsed)
+        return [self.find_ingredient_match(p) for p in parsed]

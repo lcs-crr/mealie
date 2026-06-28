@@ -2,9 +2,15 @@ from abc import ABC, abstractmethod
 
 from pydantic import UUID4, BaseModel
 from rapidfuzz import fuzz, process
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from mealie.db.models.recipe.ingredient import IngredientFoodModel, IngredientUnitModel
+from mealie.core.config import get_app_settings
+from mealie.db.models.recipe.ingredient import (
+    IngredientFoodEmbeddingModel,
+    IngredientFoodModel,
+    IngredientUnitModel,
+)
 from mealie.lang.providers import Translator
 from mealie.repos.all_repositories import get_repositories
 from mealie.repos.repository_factory import AllRepositories
@@ -35,6 +41,8 @@ class DataMatcher:
 
         self._foods_by_alias: dict[str, IngredientFood] | None = None
         self._units_by_alias: dict[str, IngredientUnit] | None = None
+
+        self._food_embeddings: list[tuple[IngredientFood, list[float]]] | None = None
 
     @property
     def foods_by_id(self) -> dict[UUID4, IngredientFood]:
@@ -95,6 +103,37 @@ class DataMatcher:
             self._units_by_alias = units_by_alias
 
         return self._units_by_alias
+
+    @property
+    def food_embeddings(self) -> list[tuple[IngredientFood, list[float]]]:
+        """Existing foods paired with their stored embedding vector, for the current model/dims.
+
+        Only embeddings matching the configured model and dimensions are returned, so a model change
+        never mixes incompatible vectors. Empty when semantic matching is disabled or unpopulated.
+        """
+        if self._food_embeddings is None:
+            settings = get_app_settings()
+            result: list[tuple[IngredientFood, list[float]]] = []
+            if settings.OPENAI_EMBEDDING_MODEL:
+                stmt = (
+                    select(IngredientFoodEmbeddingModel)
+                    .join(IngredientFoodModel, IngredientFoodEmbeddingModel.food_id == IngredientFoodModel.id)
+                    .filter(
+                        IngredientFoodModel.group_id == self.repos.group_id,
+                        IngredientFoodEmbeddingModel.model == settings.OPENAI_EMBEDDING_MODEL,
+                        IngredientFoodEmbeddingModel.dimensions == settings.OPENAI_EMBEDDING_DIMENSIONS,
+                    )
+                )
+                rows = self.repos.session.execute(stmt).scalars().all()
+                foods = self.foods_by_id
+                for row in rows:
+                    food = foods.get(row.food_id)
+                    if food is not None:
+                        result.append((food, row.embedding))
+
+            self._food_embeddings = result
+
+        return self._food_embeddings
 
     @classmethod
     def find_match[T: BaseModel](

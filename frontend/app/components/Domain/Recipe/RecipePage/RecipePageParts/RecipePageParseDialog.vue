@@ -61,6 +61,7 @@
             </div>
             <RecipeIngredientEditor
               v-model="currentIng.ingredient"
+              :priority-foods="currentIng.foodCandidates || []"
               :unit-error="!!currentMissingUnit"
               :unit-error-tooltip="$t('recipe.parser.this-unit-could-not-be-parsed-automatically')"
               :food-error="!!currentMissingFood"
@@ -137,6 +138,7 @@
                 <v-lazy v-for="(ingredient, index) in parsedIngs" :key="index">
                   <RecipeIngredientEditor
                     v-model="ingredient.ingredient"
+                    :priority-foods="ingredient.foodCandidates || []"
                     enable-drag-handle
                     enable-context-menu
                     class="list-group-item pb-8"

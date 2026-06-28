@@ -133,6 +133,138 @@ def test_openai_parser_sanitize_output(
         )
 
 
+def _find_food(foods: list[IngredientFood], name: str) -> IngredientFood:
+    return next(f for f in foods if f.name == name)
+
+
+def _enable_embeddings(monkeypatch: pytest.MonkeyPatch, *, dimensions: int = 3, threshold: float = 0.5) -> None:
+    from mealie.core.config import get_app_settings
+
+    settings = get_app_settings()
+    monkeypatch.setattr(settings, "OPENAI_EMBEDDING_MODEL", "test-embedding-model")
+    monkeypatch.setattr(settings, "OPENAI_EMBEDDING_DIMENSIONS", dimensions)
+    monkeypatch.setattr(settings, "OPENAI_FOOD_SEMANTIC_MATCH_THRESHOLD", threshold)
+
+
+def _store_food_embedding(db, food_id, vector: list[float], *, dimensions: int = 3) -> None:
+    from mealie.db.models.recipe.ingredient import IngredientFoodEmbeddingModel
+
+    db.session.add(
+        IngredientFoodEmbeddingModel(
+            session=db.session,
+            food_id=food_id,
+            model="test-embedding-model",
+            dimensions=dimensions,
+            source_text="seed",
+            embedding=vector,
+        )
+    )
+    db.session.commit()
+
+
+def _mock_openai_with_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    def mock_openai_init(self, repos):
+        self.repos = repos
+        self.custom_prompt_dir = None
+        self.default_provider = MagicMock()
+        self.audio_provider = None
+        self.image_provider = None
+
+    monkeypatch.setattr(OpenAIService, "__init__", mock_openai_init)
+
+
+def _mock_single_food_response(monkeypatch: pytest.MonkeyPatch, food: str) -> None:
+    async def mock_get_response(self, prompt: str, message: str, *args, **kwargs) -> OpenAIIngredients:
+        return OpenAIIngredients(ingredients=[OpenAIIngredient(quantity=1, unit=None, food=food, note=None)])
+
+    monkeypatch.setattr(OpenAIService, "get_response", mock_get_response)
+
+
+def test_openai_parser_semantic_match(
+    unique_local_group_id: UUID4,
+    unique_db,
+    parsed_ingredient_data: tuple[list[IngredientFood], list[IngredientUnit]],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    foods, _ = parsed_ingredient_data
+    green_onion = _find_food(foods, "green onion")
+    onion = _find_food(foods, "onion")
+
+    _enable_embeddings(monkeypatch)
+    _store_food_embedding(unique_db, green_onion.id, [1.0, 0.0, 0.0])
+    _store_food_embedding(unique_db, onion.id, [0.0, 1.0, 0.0])
+
+    _mock_openai_with_provider(monkeypatch)
+    _mock_single_food_response(monkeypatch, "scallions")  # not a fuzzy match for "green onion"
+
+    # Query vector points mostly at green onion, slightly at onion.
+    async def mock_get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        return [[0.9, 0.1, 0.0] for _ in texts]
+
+    monkeypatch.setattr(OpenAIService, "get_embeddings", mock_get_embeddings)
+
+    with session_context() as session:
+        parser = get_parser(RegisteredParser.openai, unique_local_group_id, session, get_locale_provider())
+        parsed = asyncio.run(parser.parse(["1 bunch scallions"]))
+
+    parsed_ing = cast(ParsedIngredient, parsed[0])
+    # Auto-filled to the closest existing food (carries an id), not a new CreateIngredientFood.
+    assert isinstance(parsed_ing.ingredient.food, IngredientFood)
+    assert parsed_ing.ingredient.food.id == green_onion.id
+    # Both seeded foods surfaced as candidates, green onion first.
+    candidate_ids = [c.id for c in parsed_ing.food_candidates]
+    assert candidate_ids[0] == green_onion.id
+    assert onion.id in candidate_ids
+
+
+def test_openai_parser_semantic_best_effort_falls_back(
+    unique_local_group_id: UUID4,
+    unique_db,
+    parsed_ingredient_data: tuple[list[IngredientFood], list[IngredientUnit]],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    foods, _ = parsed_ingredient_data
+    green_onion = _find_food(foods, "green onion")
+
+    _enable_embeddings(monkeypatch)
+    _store_food_embedding(unique_db, green_onion.id, [1.0, 0.0, 0.0])
+
+    _mock_openai_with_provider(monkeypatch)
+    _mock_single_food_response(monkeypatch, "scallions")
+
+    async def mock_get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        raise Exception("embeddings endpoint unavailable")
+
+    monkeypatch.setattr(OpenAIService, "get_embeddings", mock_get_embeddings)
+
+    with session_context() as session:
+        parser = get_parser(RegisteredParser.openai, unique_local_group_id, session, get_locale_provider())
+        parsed = asyncio.run(parser.parse(["1 bunch scallions"]))
+
+    parsed_ing = cast(ParsedIngredient, parsed[0])
+    # No semantic match and no fuzzy match for "scallions" -> stays an unmatched CreateIngredientFood.
+    assert isinstance(parsed_ing.ingredient.food, CreateIngredientFood)
+    assert parsed_ing.food_candidates == []
+
+
+def test_openai_parser_no_candidates_when_disabled(
+    unique_local_group_id: UUID4,
+    parsed_ingredient_data: tuple[list[IngredientFood], list[IngredientUnit]],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # OPENAI_EMBEDDING_MODEL is unset by default -> semantic matching disabled.
+    _mock_openai_with_provider(monkeypatch)
+    _mock_single_food_response(monkeypatch, "potatoes")  # exact existing food -> fuzzy still links it
+
+    with session_context() as session:
+        parser = get_parser(RegisteredParser.openai, unique_local_group_id, session, get_locale_provider())
+        parsed = asyncio.run(parser.parse(["2 potatoes"]))
+
+    parsed_ing = cast(ParsedIngredient, parsed[0])
+    assert parsed_ing.food_candidates == []
+    assert isinstance(parsed_ing.ingredient.food, IngredientFood)  # fuzzy match still works
+
+
 @pytest.mark.parametrize(
     "original_text,quantity,unit,food,note,qty_range,unit_range,food_range,note_range",
     [
